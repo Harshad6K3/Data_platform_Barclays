@@ -1,0 +1,141 @@
+# models/marts/trading/schema.yml
+# dbt schema tests for fct_trades and related models
+# These run automatically in CI and post-deploy via dbt Cloud
+
+version: 2
+
+models:
+
+  - name: fct_trades
+    description: >
+      Fact table: one row per trade lifecycle event.
+      Grain: (trade_id, event_type).
+      Tier-1 table — changes require Data Platform Lead approval.
+    meta:
+      owner: data-platform-team
+      tier: 1
+      pii: false
+      sla_utc: "07:00"
+    columns:
+
+      - name: trade_sk
+        description: Surrogate key (hash of trade_id + event_type)
+        tests:
+          - unique
+          - not_null
+
+      - name: trade_id
+        description: Source system trade identifier
+        tests:
+          - not_null
+
+      - name: event_type
+        description: Trade lifecycle event
+        tests:
+          - not_null
+          - accepted_values:
+              values: [NEW, AMEND, CANCEL, SETTLE]
+
+      - name: notional
+        description: Trade notional in local currency
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: notional_usd
+        description: Trade notional in USD (via FX rate join)
+        tests:
+          - not_null:
+              where: "currency != 'USD'"
+
+      - name: currency
+        description: ISO 4217 currency code
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "regexp_like(currency, '^[A-Z]{3}$')"
+
+      - name: trade_date
+        description: Date the trade was executed
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= '2020-01-01'"
+
+      - name: settlement_date
+        description: Expected settlement date
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "settlement_date >= trade_date"
+              where: "settlement_date is not null"
+
+      - name: status
+        tests:
+          - not_null
+          - accepted_values:
+              values: [NEW, AMEND, CANCEL, SETTLE]
+
+  - name: dim_instruments
+    description: Instrument master data. SCD Type 2.
+    columns:
+      - name: instrument_sk
+        tests: [unique, not_null]
+      - name: instrument_id
+        tests: [not_null]
+      - name: asset_class
+        tests:
+          - not_null
+          - accepted_values:
+              values: [EQUITY, FX, RATES, CREDIT, COMMODITY]
+      - name: currency
+        tests:
+          - not_null
+
+  - name: agg_daily_pnl_by_book
+    description: >
+      Daily PnL aggregated by book. Materialized daily.
+      Used by Risk Technology for regulatory capital calculations.
+    meta:
+      tier: 1
+      sla_utc: "06:30"
+    tests:
+      # No duplicate (report_date, book_id, asset_class) combinations
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [report_date, book_id, asset_class]
+    columns:
+      - name: report_date
+        tests: [not_null]
+      - name: book_id
+        tests: [not_null]
+      - name: total_notional_usd
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+# ── Source freshness checks ───────────────────────────────────────────────────
+
+sources:
+  - name: dp_curated
+    description: Curated Iceberg tables via Redshift Spectrum
+    schema: dp_curated
+    freshness:
+      warn_after:  {count: 12, period: hour}
+      error_after: {count: 24, period: hour}
+    loaded_at_field: updated_at
+    tables:
+      - name: trades
+        description: Curated trade events (raw → curated Spark job output)
+      - name: positions
+        description: End-of-day positions
+
+  - name: dp_reference
+    schema: dp_reference
+    freshness:
+      warn_after:  {count: 48, period: hour}
+      error_after: {count: 96, period: hour}
+    loaded_at_field: updated_at
+    tables:
+      - name: instruments
+      - name: counterparties
+      - name: fx_rates
